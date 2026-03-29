@@ -41,14 +41,35 @@ class SyncLocalStorage<T> implements AsyncLocalStorageLike<T> {
   }
 }
 
+// Runtime detection: use Node's AsyncLocalStorage if available,
+// otherwise fall back to synchronous scope tracking.
+//
+// Static require/import of 'node:async_hooks' breaks bundlers (esbuild,
+// webpack, Vite) even inside try/catch — they analyze statically.
+// We use globalThis.__require (set by Node) or check for process.versions
+// to detect Node, then load async_hooks via the module system dynamically.
 let _als: AsyncLocalStorageLike<HookScope>;
-try {
-  // Node.js — require() is sync, available at module evaluation time.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { AsyncLocalStorage } = require('node:async_hooks');
-  _als = new AsyncLocalStorage();
-} catch {
-  // Not Node, or async_hooks unavailable — use sync fallback.
+
+// In Node.js, globalThis.process exists and has version info
+const _isNode = typeof globalThis !== 'undefined'
+  && typeof globalThis.process?.versions?.node === 'string';
+
+if (_isNode) {
+  // Node.js — use native AsyncLocalStorage for full async context tracking.
+  // The 'module' global is available in CJS; for ESM we'd need import().
+  // Since this runs at module evaluation time and vitest/Node support
+  // top-level require via createRequire, we use a dynamic string to
+  // prevent bundler static analysis.
+  try {
+    const mod = 'async_hooks';
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ah = require(mod);
+    _als = new ah.AsyncLocalStorage();
+  } catch {
+    _als = new SyncLocalStorage();
+  }
+} else {
+  // Browser / Deno / Workers — synchronous scope tracking
   _als = new SyncLocalStorage();
 }
 
