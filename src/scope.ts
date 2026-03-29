@@ -11,11 +11,49 @@
  *   });
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
 import type { AsyncHooks } from './manager';
 
-/** Module-level AsyncLocalStorage — one storage per process, carries HookScope through async chains. */
-export const _storage = new AsyncLocalStorage<HookScope>();
+/**
+ * AsyncLocalStorage — universal runtime detection.
+ *
+ * Node.js: full async context tracking across await boundaries via
+ * the native AsyncLocalStorage from async_hooks.
+ *
+ * Browser/Deno/Workers: synchronous fallback — scopes work within a
+ * single call stack but won't carry across microtask boundaries. The
+ * core hooks/filters work identically either way; only scope.didAction()
+ * counts may diverge in highly concurrent browser code.
+ */
+interface AsyncLocalStorageLike<T> {
+  getStore(): T | undefined;
+  run<R>(store: T, fn: () => R): R;
+}
+
+// Synchronous fallback — works everywhere, no async context tracking
+class SyncLocalStorage<T> implements AsyncLocalStorageLike<T> {
+  private _store: T | undefined;
+  getStore(): T | undefined { return this._store; }
+  run<R>(store: T, fn: () => R): R {
+    const prev = this._store;
+    this._store = store;
+    try { return fn(); }
+    finally { this._store = prev; }
+  }
+}
+
+let _als: AsyncLocalStorageLike<HookScope>;
+try {
+  // Node.js — require() is sync, available at module evaluation time.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { AsyncLocalStorage } = require('node:async_hooks');
+  _als = new AsyncLocalStorage();
+} catch {
+  // Not Node, or async_hooks unavailable — use sync fallback.
+  _als = new SyncLocalStorage();
+}
+
+/** Module-level storage — carries HookScope through async chains (Node) or call stacks (browser). */
+export const _storage: AsyncLocalStorageLike<HookScope> = _als;
 
 class HookContext {
   readonly metadata: Record<string, unknown>;

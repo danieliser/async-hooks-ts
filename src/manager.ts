@@ -14,7 +14,9 @@
  *  - Typed payload validation (registerSchema / validatePayloads)
  */
 
-import { randomUUID } from 'node:crypto';
+// Use globalThis.crypto.randomUUID() — works in Node 19+, all modern browsers,
+// Deno, Bun, and Cloudflare Workers. No Node-specific import needed.
+const randomUUID = (): string => globalThis.crypto.randomUUID();
 import { _storage, HookScope } from './scope';
 import {
   ActionOptions,
