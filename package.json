@@ -2,12 +2,14 @@
   "name": "async-hooks-ts",
   "version": "0.1.0",
   "description": "WordPress-style async hooks/filters for TypeScript",
-  "main": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
   "exports": {
     ".": {
+      "import": "./src/index.ts",
       "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
     }
   },
   "scripts": {
@@ -21,7 +23,6 @@
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  }
+  "type": "module",
+  "module": "./src/index.ts"
 }
