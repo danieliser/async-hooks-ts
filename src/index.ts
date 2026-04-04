@@ -6,6 +6,7 @@ export {
   DuplicateCallbackError,
   HookTimeoutError,
   HookPayloadError,
+  VetoError,
 } from './types';
 export type {
   HandlerInfo,

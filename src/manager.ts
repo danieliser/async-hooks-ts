@@ -28,6 +28,7 @@ import {
   HandlerInfo,
   HookPayloadError,
   PayloadSchema,
+  VetoError,
 } from './types';
 
 const DEFAULT_ACTION_TIMEOUT = 30;
@@ -100,6 +101,10 @@ export class AsyncHooks {
   private readonly _filterAcceptedArgs = new Map<string, number>();
   private readonly _detachedCallbacks = new Set<string>();
 
+  // Tag tracking for bulk removal
+  private readonly _callbackTags = new Map<string, string>();    // callbackId → tag
+  private readonly _tagCallbacks = new Map<string, Set<string>>(); // tag → set of callbackIds
+
   // Global wildcard handlers — fired for every event
   private readonly _globalHooks = new Map<number, GlobalEntry[]>();
   private _globalNesting = 0;
@@ -163,6 +168,9 @@ export class AsyncHooks {
     }
     if (options.detach) {
       this._detachedCallbacks.add(callbackId);
+    }
+    if (options.tag) {
+      this._storeTag(callbackId, options.tag);
     }
 
     return callbackId;
@@ -246,6 +254,84 @@ export class AsyncHooks {
         this._cleanupRemovals('action', hookName);
       }
     }
+  }
+
+  /**
+   * Fire an action hook and collect non-null/undefined return values.
+   *
+   * Same priority-ordered execution as doAction. Each callback receives a
+   * shallow copy of the first arg if it's an object (mutations don't leak).
+   * Errors are isolated per handler (logged, skipped). Detached callbacks
+   * are fire-and-forget (results not collected). Global handlers fire after
+   * but their results are NOT collected.
+   */
+  async doActionCollect(hookName: string, ...args: unknown[]): Promise<unknown[]> {
+    const results: unknown[] = [];
+    const hasSpecific = this._actionHooks.has(hookName);
+    const hasGlobal = this._globalHooks.size > 0;
+    if (!hasSpecific && !hasGlobal) return results;
+
+    if (this._validatePayloads && this._hookSchemas.has(hookName)) {
+      this._validatePayload(hookName, args.length > 0 ? args[0] : {});
+    }
+
+    this._actionCallCount.set(hookName, (this._actionCallCount.get(hookName) ?? 0) + 1);
+    this._actionNesting.set(hookName, (this._actionNesting.get(hookName) ?? 0) + 1);
+
+    _storage.getStore()?.recordAction(hookName);
+
+    try {
+      if (hasSpecific) {
+        const priorityMap = this._actionHooks.get(hookName)!;
+        for (const priority of [...priorityMap.keys()].sort((a, b) => a - b)) {
+          for (const [callbackId, callback] of [...priorityMap.get(priority)!]) {
+            if (this._removedActions.get(hookName)?.has(callbackId)) continue;
+
+            if (this._detachedCallbacks.has(callbackId)) {
+              void this._runDetachedListener(callbackId, hookName, callback, args);
+            } else {
+              const timeout = this._callbackTimeouts.has(callbackId)
+                ? this._callbackTimeouts.get(callbackId)!
+                : this._actionTimeout;
+
+              // Build args with shallow copy of first arg if it's an object
+              const callArgs = this._shallowCopyFirstArg(args);
+
+              try {
+                const result = await this._runActionListenerWithResult(
+                  callbackId, hookName, callback, callArgs, timeout,
+                );
+                if (result != null) results.push(result);
+              } catch (err) {
+                if (isTimeoutError(err)) {
+                  console.warn(
+                    `do_action_collect timeout hook=${hookName} callback=${callbackId} timeout_seconds=${timeout}`,
+                  );
+                } else {
+                  console.error(
+                    `do_action_collect exception hook=${hookName} callback=${callbackId} error=${
+                      err instanceof Error ? err.constructor.name : typeof err
+                    }`,
+                    err,
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (hasGlobal) {
+        await this._runGlobalHooks(hookName, args);
+      }
+    } finally {
+      this._actionNesting.set(hookName, (this._actionNesting.get(hookName) ?? 1) - 1);
+      if ((this._actionNesting.get(hookName) ?? 0) === 0) {
+        this._cleanupRemovals('action', hookName);
+      }
+    }
+
+    return results;
   }
 
   /**
@@ -371,6 +457,9 @@ export class AsyncHooks {
     if (options.timeoutSeconds != null) {
       this._callbackTimeouts.set(callbackId, options.timeoutSeconds);
     }
+    if (options.tag) {
+      this._storeTag(callbackId, options.tag);
+    }
 
     return callbackId;
   }
@@ -414,11 +503,14 @@ export class AsyncHooks {
 
     try {
       let currentValue = value;
+      let vetoed = false;
 
       if (hasSpecific) {
         const priorityMap = this._filterHooks.get(hookName)!;
         for (const priority of [...priorityMap.keys()].sort((a, b) => a - b)) {
+          if (vetoed) break;
           for (const [callbackId, callback] of [...priorityMap.get(priority)!]) {
+            if (vetoed) break;
             if (this._removedFilters.get(hookName)?.has(callbackId)) continue;
 
             const timeout = this._callbackTimeouts.has(callbackId)
@@ -437,7 +529,14 @@ export class AsyncHooks {
                 timeout,
               );
             } catch (err) {
-              if (isTimeoutError(err)) {
+              if (err instanceof VetoError) {
+                // Short-circuit: mark vetoed, stop chain
+                if (currentValue != null && typeof currentValue === 'object') {
+                  (currentValue as Record<string, unknown>)._vetoed = true;
+                  (currentValue as Record<string, unknown>)._veto_reason = err.reason;
+                }
+                vetoed = true;
+              } else if (isTimeoutError(err)) {
                 console.warn(
                   `apply_filters timeout hook=${hookName} callback=${callbackId} timeout_seconds=${timeout}`,
                 );
@@ -583,7 +682,7 @@ export class AsyncHooks {
    *                    but NOT "taskrunner.created".
    * @returns Unique callbackId for use with unsubscribeAll().
    */
-  subscribeAll(callback: CallbackType, priority = 90, namespace?: string): string {
+  subscribeAll(callback: CallbackType, priority = 90, namespace?: string, tag?: string): string {
     if (typeof callback !== 'function') throw new TypeError('callback must be callable');
     if (!Number.isInteger(priority)) throw new TypeError('priority must be an integer');
     if (namespace !== undefined && (!namespace || typeof namespace !== 'string')) {
@@ -595,6 +694,10 @@ export class AsyncHooks {
     this._globalHooks.get(priority)!.push([callbackId, callback, namespace ?? null]);
     this._callbackRegistry.set(callbackId, callback);
     this._callbackTypes.set(callbackId, 'global');
+
+    if (tag) {
+      this._storeTag(callbackId, tag);
+    }
 
     return callbackId;
   }
@@ -613,6 +716,50 @@ export class AsyncHooks {
     }
 
     return this._removeGlobalCallback(callbackId);
+  }
+
+  /**
+   * Remove all callbacks (actions, filters, globals) registered with the given tag.
+   * Returns the number of callbacks removed.
+   */
+  removeByTag(tag: string): number {
+    const callbackIds = this._tagCallbacks.get(tag);
+    if (!callbackIds?.size) return 0;
+
+    let count = 0;
+    for (const callbackId of [...callbackIds]) {
+      const kind = this._callbackTypes.get(callbackId);
+      if (!kind) continue;
+
+      let removed = false;
+      if (kind === 'global') {
+        if (this._globalNesting > 0) {
+          this._removedGlobals.add(callbackId);
+          removed = true;
+        } else {
+          removed = this._removeGlobalCallback(callbackId);
+        }
+      } else {
+        const hookName = this._callbackHooks.get(callbackId);
+        if (!hookName) continue;
+
+        const nestingMap = kind === 'action' ? this._actionNesting : this._filterNesting;
+        if ((nestingMap.get(hookName) ?? 0) > 0) {
+          const removedBucket = kind === 'action' ? this._removedActions : this._removedFilters;
+          this._getOrCreate(removedBucket, hookName).add(callbackId);
+          removed = true;
+        } else {
+          removed = this._removeCallback(kind, hookName, callbackId);
+        }
+      }
+
+      if (removed) count++;
+    }
+
+    // Clean up tag maps for non-deferred removals
+    this._cleanupTagMaps(tag);
+
+    return count;
   }
 
   /** Return true if callbackId is a registered global handler. */
@@ -836,6 +983,7 @@ export class AsyncHooks {
       this._callbackRegistry.delete(callbackId);
       this._callbackTypes.delete(callbackId);
       this._removedGlobals.delete(callbackId);
+      this._removeTagForCallback(callbackId);
     }
     return removed;
   }
@@ -845,6 +993,63 @@ export class AsyncHooks {
       this._removeGlobalCallback(callbackId);
     }
     this._removedGlobals.clear();
+  }
+
+  private _storeTag(callbackId: string, tag: string): void {
+    this._callbackTags.set(callbackId, tag);
+    if (!this._tagCallbacks.has(tag)) this._tagCallbacks.set(tag, new Set());
+    this._tagCallbacks.get(tag)!.add(callbackId);
+  }
+
+  private _removeTagForCallback(callbackId: string): void {
+    const tag = this._callbackTags.get(callbackId);
+    if (!tag) return;
+    this._callbackTags.delete(callbackId);
+    const ids = this._tagCallbacks.get(tag);
+    if (ids) {
+      ids.delete(callbackId);
+      if (ids.size === 0) this._tagCallbacks.delete(tag);
+    }
+  }
+
+  private _cleanupTagMaps(tag: string): void {
+    const ids = this._tagCallbacks.get(tag);
+    if (!ids) return;
+    for (const id of [...ids]) {
+      if (!this._callbackRegistry.has(id)) {
+        ids.delete(id);
+        this._callbackTags.delete(id);
+      }
+    }
+    if (ids.size === 0) this._tagCallbacks.delete(tag);
+  }
+
+  private _shallowCopyFirstArg(args: unknown[]): unknown[] {
+    if (args.length === 0) return args;
+    const first = args[0];
+    if (first != null && typeof first === 'object' && !Array.isArray(first)) {
+      return [{ ...first }, ...args.slice(1)];
+    }
+    return [...args];
+  }
+
+  private async _runActionListenerWithResult(
+    _callbackId: string,
+    _hookName: string,
+    callback: CallbackType,
+    args: unknown[],
+    timeout: number | null,
+  ): Promise<unknown> {
+    const run = async (): Promise<unknown> => {
+      const result = callback(...args);
+      if (isThenable(result)) return await result;
+      return result;
+    };
+
+    if (timeout != null) {
+      return await runWithTimeout(run, timeout);
+    }
+    return await run();
   }
 
   private _validatePayload(hookName: string, payload: unknown): void {
@@ -973,6 +1178,7 @@ export class AsyncHooks {
       this._detachedCallbacks.delete(callbackId);
       this._removedActions.get(hookName)?.delete(callbackId);
       this._removedFilters.get(hookName)?.delete(callbackId);
+      this._removeTagForCallback(callbackId);
     }
 
     return removed;
@@ -1008,6 +1214,7 @@ export class AsyncHooks {
       this._callbackTimeouts.delete(callbackId);
       this._filterAcceptedArgs.delete(callbackId);
       this._detachedCallbacks.delete(callbackId);
+      this._removeTagForCallback(callbackId);
     }
 
     removedBucket.delete(hookName);

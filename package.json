@@ -1,6 +1,6 @@
 {
   "name": "async-hooks-ts",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WordPress-style async hooks/filters for TypeScript",
   "main": "./src/index.ts",
   "types": "./src/index.ts",

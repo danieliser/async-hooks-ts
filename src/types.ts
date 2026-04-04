@@ -15,6 +15,15 @@ export class HookNotFoundError extends HookError {}
 export class DuplicateCallbackError extends HookError {}
 export class HookTimeoutError extends HookError {}
 
+export class VetoError extends HookError {
+  readonly reason: string;
+  constructor(reason = '') {
+    super(`Filter vetoed: ${reason}`);
+    this.reason = reason;
+    Object.setPrototypeOf(this, new.target.prototype);
+  }
+}
+
 export class HookPayloadError extends HookError {
   constructor(
     public readonly hookName: string,
@@ -55,6 +64,8 @@ export interface ActionOptions {
    * doAction returns without waiting. Detached callbacks run concurrently.
    */
   detach?: boolean;
+  /** Arbitrary tag for bulk removal via removeByTag(). */
+  tag?: string;
 }
 
 /** Options for addFilter / intercept */
@@ -66,6 +77,8 @@ export interface FilterOptions {
   acceptedArgs?: number;
   /** Per-callback timeout in seconds (overrides instance default). null = no timeout. */
   timeoutSeconds?: number | null;
+  /** Arbitrary tag for bulk removal via removeByTag(). */
+  tag?: string;
 }
 
 /** Options for AsyncHooks constructor */
